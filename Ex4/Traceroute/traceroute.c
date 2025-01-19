@@ -1,3 +1,4 @@
+#include "traceroute.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,22 +13,16 @@
 #include <unistd.h>
 #include <signal.h>
 #include <getopt.h>
-#include "traceroute.h"
-
-// Function prototypes
-unsigned short int calculate_checksum(void *data, unsigned int bytes);
-double calculate_rtt(struct timeval *start, struct timeval *end);
 
 int main(int argc, char *argv[]) {
     int opt;
     char *address = NULL;
-    int ttl = 1;
 
     // Parse command-line arguments to get the target address
     while ((opt = getopt(argc, argv, "a:")) != -1) {
         switch (opt) {
             case 'a':
-                address = optarg; // Assign the provided address
+                address = optarg;
                 break;
             default:
                 fprintf(stderr, "Usage: %s -a <address>\n", argv[0]);
@@ -50,7 +45,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // Create a raw socket for ICMP
+    // Create a raw socket for IP
     int sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
     if (sock < 0) {
         perror("socket");
@@ -60,42 +55,47 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    // Set IP_HDRINCL option
+    int one = 1;
+    if (setsockopt(sock, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one)) < 0) {
+        perror("setsockopt");
+        close(sock);
+        return 1;
+    }
+
     // Print the traceroute header
     fprintf(stdout, "Traceroute to %s, %d hops max:\n", address, MAX_HOPS);
 
     // Loop over each TTL (Time to Live)
-    for (ttl = 1; ttl <= MAX_HOPS; ++ttl) {
-        // Set the TTL value for the current hop
-        if (setsockopt(sock, IPPROTO_IP, IP_TTL, &ttl, sizeof(ttl)) != 0) {
-            perror("setsockopt");
-            close(sock);
-            return 1;
-        }
-
+    for (int ttl = 1; ttl <= MAX_HOPS; ++ttl) {
         fprintf(stdout, "%2d  ", ttl); // Print the current hop number
         int success = 0; // Track if any packet was successful
 
         // Send multiple packets for each hop
         for (int i = 0; i < PACKETS_PER_HOP; ++i) {
-            char buffer[BUFFER_SIZE] = {0}; // Buffer to hold the ICMP packet
-            struct icmphdr icmp_hdr; // ICMP header
-            icmp_hdr.type = ICMP_ECHO;
-            icmp_hdr.code = 0;
-            icmp_hdr.un.echo.id = htons(getpid()); // Use process ID as identifier
-            icmp_hdr.un.echo.sequence = htons(ttl * PACKETS_PER_HOP + i); // Sequence number
-            icmp_hdr.checksum = 0;
-            memcpy(buffer, &icmp_hdr, sizeof(icmp_hdr));
-            icmp_hdr.checksum = calculate_checksum(buffer, sizeof(icmp_hdr));
-            ((struct icmphdr *)buffer)->checksum = icmp_hdr.checksum;
+            char packet[BUFFER_SIZE] = {0}; // Buffer to hold the full packet
+            struct iphdr *ip_hdr = (struct iphdr *)packet;
+            struct icmphdr *icmp_hdr = (struct icmphdr *)(packet + sizeof(struct iphdr));
+
+            // Build the IP header
+            build_ip_header(ip_hdr, &dest_addr, ttl, sizeof(struct icmphdr));
+
+            // Build the ICMP header
+            icmp_hdr->type = ICMP_ECHO;
+            icmp_hdr->code = 0;
+            icmp_hdr->un.echo.id = htons(getpid());
+            icmp_hdr->un.echo.sequence = htons(ttl * PACKETS_PER_HOP + i);
+            icmp_hdr->checksum = 0;
+            icmp_hdr->checksum = calculate_checksum(icmp_hdr, sizeof(struct icmphdr));
 
             struct timeval start, end; // Timestamps for RTT calculation
             gettimeofday(&start, NULL); // Record start time
 
-            // Send the ICMP packet
-            if (sendto(sock, buffer, sizeof(icmp_hdr), 0,
+            // Send the custom packet
+            if (sendto(sock, packet, sizeof(struct iphdr) + sizeof(struct icmphdr), 0,
                        (struct sockaddr *)&dest_addr, sizeof(dest_addr)) <= 0) {
                 perror("sendto");
-                fprintf(stdout, "* "); // Indicate failure for this packet
+                fprintf(stdout, "* ");
                 continue;
             }
 
@@ -152,6 +152,24 @@ int main(int argc, char *argv[]) {
 
     close(sock); // Close the socket
     return 0;
+}
+
+// Build the IP header
+void build_ip_header(struct iphdr *ip_hdr, struct sockaddr_in *dest_addr, int ttl, int payload_len) {
+    ip_hdr->version = 4; // IPv4
+    ip_hdr->ihl = 5; // Header length (5 x 4 = 20 bytes)
+    ip_hdr->tos = 0; // Type of Service
+    ip_hdr->tot_len = htons(sizeof(struct iphdr) + payload_len); // Total length
+    ip_hdr->id = htons(getpid()); // Unique ID
+    ip_hdr->frag_off = 0; // Fragment offset
+    ip_hdr->ttl = ttl; // Time to Live
+    ip_hdr->protocol = IPPROTO_ICMP; // Protocol: ICMP
+    ip_hdr->check = 0; // Checksum (set later)
+    ip_hdr->saddr = INADDR_ANY; // Source address (kernel will fill)
+    ip_hdr->daddr = dest_addr->sin_addr.s_addr; // Destination address
+
+    // Calculate the IP header checksum
+    ip_hdr->check = calculate_checksum(ip_hdr, sizeof(struct iphdr));
 }
 
 // Calculate checksum for IP or ICMP headers
